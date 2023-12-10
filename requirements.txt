@@ -1,0 +1,10 @@
+torch
+torchvision
+transformers
+diffusers
+wandb
+tqdm
+scipy
+datetime
+einops
+math
