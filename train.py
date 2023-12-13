@@ -66,6 +66,7 @@ if __name__   == "__main__":
     
     # Start training
     print("***** Running training *****")
+    diffusion.model.train()
     for epoch in tqdm(range(args.num_epochs), desc='diffusion training'):
             epoch_loss = list()
             for sample_batch in tqdm(dataloader, desc="Batches"):
@@ -86,12 +87,14 @@ if __name__   == "__main__":
             wandb.log({"epoch": epoch, "mean_batch_loss": np.mean(epoch_loss)})
             
             if (epoch+1) % 10 == 0:
-                torch.save(diffusion.model.state_dict(), f'./logs/checkpoints/{args.run_name}_{epoch+1}.pth')
+                torch.save(diffusion.model.state_dict(), f'./checkpoints/{args.run_name}_{epoch+1}.pth')
                 print(f'Model saved at epoch {epoch+1}')
     
     # Start evaluation
     print("***** Running evaluation *****")
-    x_sample, label_sample = generator.generate_data(args.num_loss, theta=theta_estimate, torch_tensor=True)
+    diffusion.model.eval()
+    x_sample, label_sample = generator.generate_data(args.num_loss, theta=theta_estimate.detach().cpu().numpy()\
+                                , torch_tensor=True)
     with torch.no_grad():
         # noise prediction error of the un-trained UNet
         loss_diff = diffusion(x_sample.to(device), label_sample.view(-1).to(device))
@@ -108,12 +111,13 @@ if __name__   == "__main__":
         scores = scores_raw - penalty
 
         # compute conditional diffusion loss
-        x_sample = generator.generate_conditional_data(args.num_loss, theta_estimate, target, torch_tensor=True)
+        x_sample = generator.generate_conditional_data(args.num_loss, theta_estimate.detach().cpu().numpy()\
+                        , target, torch_tensor=True)
         with torch.no_grad():
             loss_diff_cond = diffusion(x_sample.to(device), target * torch.ones(args.num_loss).to(device))
 
         # log the data
-        wandb.log({
+        wandb.log({"target":target,
             "norm_mean":np.mean(np.linalg.norm(samples, axis=-1)),
             "ratio":np.mean(ratio),
             "dis_mismatch":loss_diff_cond / loss_diff,
@@ -121,4 +125,10 @@ if __name__   == "__main__":
             "ave_raw_score":np.mean(scores_raw),
             "ave_score":np.mean(scores)
         })
+        print("target: %f"%target)
+        print("norm_mean: %f"%(np.mean(np.linalg.norm(samples, axis=-1))))
+        print("ratio: %f"%(np.mean(ratio)))
         print("dis_mismatch: %f"%(loss_diff_cond / loss_diff))
+        print("penalty: %f"%(np.mean(penalty)))
+        print("ave_raw_score: %f"%(np.mean(scores_raw)))
+        print("ave_score: %f"%(np.mean(scores)))
