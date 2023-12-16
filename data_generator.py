@@ -22,6 +22,9 @@ class GaussianLatentSampler(object):
 
     def generate_data(self, N, theta=None, torch_tensor=False):
         z = np.random.randn(N, self.d_inner)
+        
+        z /= np.linalg.norm(z, axis=-1, keepdims=True)
+        
         x = z.dot(self.A)
         label = x.dot(theta) if theta is not None else x.dot(self.theta)
         if torch_tensor:
@@ -81,4 +84,4 @@ if __name__ == '__main__':
     print('RLS', theta_hat.shape)
     
     y_max = D_explored.acquisition()
-    print('y_min', y_min)
+    print('y_max', y_max)
