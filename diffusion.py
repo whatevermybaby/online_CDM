@@ -3,8 +3,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from tqdm import tqdm
-
 
 # gaussian diffusion trainer class
 def extract(a, t, x_shape):
@@ -95,7 +93,7 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def sample(self, classes):
         img = torch.randn((classes.shape[0], self.image_size), device=self.betas.device)
-        for t in tqdm(range(self.num_timesteps - 1, -1, -1), desc='sampling'):
+        for t in range(self.num_timesteps - 1, -1, -1):
             img = self.p_sample(img, t, classes)
 
         return img

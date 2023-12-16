@@ -1,6 +1,7 @@
 import torch
 from collections import defaultdict
 from scipy.stats import ortho_group
+from exploration import D_exp
 import numpy as np
 
 
@@ -20,7 +21,8 @@ class GaussianLatentSampler(object):
         self.theta = self.A.T.dot(beta)
 
     def generate_data(self, N, theta=None, torch_tensor=False):
-        x = np.random.randn(N, self.d_inner).dot(self.A)
+        z = np.random.randn(N, self.d_inner)
+        x = z.dot(self.A)
         label = x.dot(theta) if theta is not None else x.dot(self.theta)
         if torch_tensor:
             x, label = torch.from_numpy(x).float(), torch.from_numpy(label).float()
@@ -34,6 +36,16 @@ class GaussianLatentSampler(object):
         x = np.random.multivariate_normal(conditional_mean, conditional_var, size=N).dot(self.A)
 
         return torch.from_numpy(x).float() if torch_tensor else x
+    
+    def evaluate(self, x, penalty=5.0):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        parallel = x.dot(self.A.T).dot(self.A)
+        vertical = x - parallel
+        penalty_term = penalty * np.sum(np.square(vertical), axis=-1).reshape(-1, 1)
+        scores_raw = x.dot(self.theta)
+        scores = scores_raw - penalty_term
+        return torch.from_numpy(scores).float()
 
 
 
@@ -44,24 +56,29 @@ if __name__ == '__main__':
     from torch.utils.data import DataLoader
 
     # random seed
-    set_seed(seed=1234)
+    set_seed(seed=42)
 
     # hyperparameters
     N_pred, N_diff, N_eval, N_loss = 8192, 65536, 2048, 8192
     d_inner, d_outer = 16, 64
     lam = 5.0
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # generate weights
     generator = GaussianLatentSampler(d_inner, d_outer)
 
-    # train predictor
-    data_pred, label_pred = generator.generate_data(N_pred)
-    theta_estimate = np.linalg.pinv(data_pred.T.dot(data_pred) + np.eye(d_outer)).dot(data_pred.T.dot(label_pred))
-
-    # train diffusion model
-    diffusion = GaussianDiffusion(model=Unet1D(dim=64), image_size=64, timesteps=200)
-    optimizer_diff = torch.optim.Adam(diffusion.model.parameters(), lr=8e-5, betas=(0.9, 0.99))
-
-    data_diff, _ = generator.generate_data(N_diff, torch_tensor=True)
-    dataset_diff = DataLoader(data_diff, batch_size=32)
-    print(dataset_diff)
+    # exploration dataset
+    X_initial, Y_initial = generator.generate_data(50, torch_tensor=True)
+    D_explored = D_exp(X_initial , Y_initial)
+    print(D_explored.x.shape)
+    print(D_explored.y.shape)
+    
+    theta_TS = D_explored.TS_estimator(beta_0=1, t_count=1).to(device)
+    print('TS', theta_TS.shape)
+    
+    theta_hat = D_explored.RLS_estimate().to(device)
+    print('RLS', theta_hat.shape)
+    
+    y_max = D_explored.acquisition()
+    print('y_min', y_min)

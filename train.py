@@ -9,6 +9,7 @@ from collections import defaultdict
 from scipy.stats import ortho_group
 import numpy as np
 from data_generator import GaussianLatentSampler, set_seed
+from exploration import D_exp
 from diffusion import GaussianDiffusion
 import wandb
 import datetime
@@ -18,17 +19,20 @@ if __name__   == "__main__":
     parser = argparse.ArgumentParser()
 
     # Add arguments
-    parser.add_argument('--num_epochs', type=int, default=10, help='number of epochs to train')
+    parser.add_argument('--num_epochs', type=int, default=30, help='number of epochs for Bayesian optimization')
+    parser.add_argument('--num_inner_epochs', type=int, default=10, help='number of epochs to train diffusion')
     parser.add_argument('--batch_size', type=int, default=128, help='input batch size for training')
     parser.add_argument('--learning_rate', type=float, default=0.0003, help='learning rate')
-    parser.add_argument('--num_labelled', type=int, default=8192)
     parser.add_argument('--num_unlabelled', type=int, default=65536)
     parser.add_argument('--num_eval', type=int, default=2048)
-    parser.add_argument('--num_loss', type=int, default=8192)
     parser.add_argument('--penalty', type=float, default=5.0)
-    parser.add_argument('--run_name', type=str, default='test')
+    
     parser.add_argument('--dim_latent', type=int, default=16)
     parser.add_argument('--dim_input', type=int, default=64)
+    
+    parser.add_argument('--num_initial_data', type=int, default=10)
+    parser.add_argument('--beta_0', type=float, default=1.0)
+    parser.add_argument('--run_name', type=str, default='test')
 
     args = parser.parse_args()
 
@@ -48,87 +52,53 @@ if __name__   == "__main__":
     # unlabelled/labelled data generator
     generator = GaussianLatentSampler(args.dim_latent, args.dim_input)
 
-    # train predictor
-    data_pred, label_pred = generator.generate_data(args.num_labelled)
-    theta_estimate = np.linalg.pinv(data_pred.T.dot(data_pred) + np.eye(args.dim_input)).dot(data_pred.T.dot(label_pred))
-
     # train diffusion model
     diffusion = GaussianDiffusion(model=Unet1D(dim=64), image_size=64, timesteps=200)
-    optimizer_diff = torch.optim.Adam(diffusion.model.parameters(), lr=args.learning_rate, betas=(0.9, 0.99))
-
-    data_diff, _ = generator.generate_data(args.num_unlabelled, torch_tensor=True)
-    dataloader = DataLoader(data_diff, batch_size=args.batch_size, shuffle=True)
-    
-    # move to GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     diffusion = diffusion.to(device)
-    theta_estimate = torch.from_numpy(theta_estimate).float().to(device)
     
-    # Start training
+    # exploration dataset
+    X_initial, Y_initial = generator.generate_data(args.num_initial_data, torch_tensor=True)
+    D_explored = D_exp(X_initial , Y_initial, device=device)
+    
+    optimizer = torch.optim.Adam(diffusion.model.parameters(),\
+                        lr=args.learning_rate, betas=(0.9, 0.99))
+
+    unlabelled_data, _ = generator.generate_data(args.num_unlabelled, torch_tensor=True)
+    dataloader = DataLoader(unlabelled_data, batch_size=args.batch_size, shuffle=True)
+     
     print("***** Running training *****")
-    diffusion.model.train()
-    for epoch in tqdm(range(args.num_epochs), desc='diffusion training'):
-            epoch_loss = list()
-            for sample_batch in tqdm(dataloader, desc="Batches"):
-                sample_batch = sample_batch.to(device)
 
-                predicted_score_batch = sample_batch.matmul(theta_estimate)
-                predicted_score_batch += 0.01 * torch.randn_like(predicted_score_batch)
-                
-                loss_diffusion = diffusion(sample_batch, predicted_score_batch.detach().view(-1))
-
-                optimizer_diff.zero_grad()
-                loss_diffusion.backward()
-                optimizer_diff.step()
-
-                wandb.log({"mean_sample_loss": loss_diffusion.item() / args.batch_size})
-                epoch_loss.append(loss_diffusion.item())
-            print(f'Epoch [{epoch+1}/{args.num_epochs}], Loss: {np.mean(epoch_loss):.4f}')
-            wandb.log({"epoch": epoch, "mean_batch_loss": np.mean(epoch_loss)})
-            
-            if (epoch+1) % 10 == 0:
-                torch.save(diffusion.model.state_dict(), f'./checkpoints/{args.run_name}_{epoch+1}.pth')
-                print(f'Model saved at epoch {epoch+1}')
-    
-    # Start evaluation
-    print("***** Running evaluation *****")
-    diffusion.model.eval()
-    x_sample, label_sample = generator.generate_data(args.num_loss, theta=theta_estimate.detach().cpu().numpy()\
-                                , torch_tensor=True)
-    with torch.no_grad():
-        # noise prediction error of the un-trained UNet
-        loss_diff = diffusion(x_sample.to(device), label_sample.view(-1).to(device))
+    for t in tqdm(range(1,args.num_epochs+1), desc='Bayesian optimization'):
+        theta_TS = D_explored.TS_estimator(beta_0=args.beta_0, t_count=t)
         
-    for target in 0.1 * np.arange(100):
-        target_scores = target * torch.ones(args.num_eval).to(device)
-        samples = diffusion.sample(target_scores).view(-1, args.dim_input).cpu().numpy()
+        diffusion.model.train()
+        for inner_epoch in range(args.num_inner_epochs):
+                epoch_loss = list()
+                for idx, sample_batch in tqdm(enumerate(dataloader), total=len(dataloader),\
+                            desc=f"Diffusion Training (epoch {inner_epoch+1}/{args.num_inner_epochs})"):
+                    sample_batch = sample_batch.to(device)
 
-        parallel = samples.dot(generator.A.T).dot(generator.A) # (args.num_eval,64)
-        vertical = samples - parallel  # (args.num_eval,64)
-        ratio = np.linalg.norm(vertical, axis=-1) / (np.linalg.norm(parallel, axis=-1) + 1e-8)
-        penalty = args.penalty * np.sum(np.square(vertical), axis=-1).reshape(-1, 1)
-        scores_raw = samples.dot(generator.theta)
-        scores = scores_raw - penalty
+                    labeled_samples = sample_batch.matmul(theta_TS)
+                    noisy_score_batch = labeled_samples + 0.01 * torch.randn_like(labeled_samples)
+                    
+                    loss = diffusion(sample_batch, noisy_score_batch.detach().view(-1))
 
-        # compute conditional diffusion loss
-        x_sample = generator.generate_conditional_data(args.num_loss, theta_estimate.detach().cpu().numpy()\
-                        , target, torch_tensor=True)
-        with torch.no_grad():
-            loss_diff_cond = diffusion(x_sample.to(device), target * torch.ones(args.num_loss).to(device))
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-        # log the data
-        wandb.log({"target":target,
-            "norm_mean":np.mean(np.linalg.norm(samples, axis=-1)),
-            "ratio":np.mean(ratio),
-            "dis_mismatch":loss_diff_cond / loss_diff,
-            "penalty":np.mean(penalty),
-            "ave_raw_score":np.mean(scores_raw),
-            "ave_score":np.mean(scores)
-        })
-        print("target: %f"%target)
-        print("norm_mean: %f"%(np.mean(np.linalg.norm(samples, axis=-1))))
-        print("ratio: %f"%(np.mean(ratio)))
-        print("dis_mismatch: %f"%(loss_diff_cond / loss_diff))
-        print("penalty: %f"%(np.mean(penalty)))
-        print("ave_raw_score: %f"%(np.mean(scores_raw)))
-        print("ave_score: %f"%(np.mean(scores)))
+                    epoch_loss.append(loss.item())
+                print(f'Epoch [{inner_epoch+1}/{args.num_inner_epochs}], Loss: {np.mean(epoch_loss):.4f}')
+                # wandb.log({"inner_epoch": inner_epoch, "mean_batch_loss": np.mean(epoch_loss)})
+                
+                # if (inner_epoch+1) % args.num_inner_epochs == 0:
+                #     torch.save(diffusion.model.state_dict(), f'./checkpoints/{args.run_name}_{inner_epoch+1}.pth')
+                #     print(f'Model saved at epoch {inner_epoch+1}')
+        new_sample = diffusion.sample(D_explored.acquisition()).view(-1, args.dim_input)
+        print('maximum y', D_explored.acquisition().item())
+        wandb.log({"epoch": t, "maximum y": D_explored.acquisition().item()})
+        
+        D_explored.update(new_sample, generator.evaluate(new_sample).to(device))
+        
+
