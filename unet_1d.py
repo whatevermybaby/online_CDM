@@ -124,12 +124,19 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x, time_emb=None, class_emb=None):
         scale_shift = None
+        
         if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
             cond_emb = tuple(filter(exists, (time_emb, class_emb)))
-            cond_emb = torch.cat(cond_emb, dim=-1)
-            cond_emb = self.mlp(cond_emb)
-            cond_emb = rearrange(cond_emb, 'b c -> b c 1')
-            scale_shift = cond_emb.chunk(2, dim=1)
+            cond_emb = torch.cat(cond_emb, dim=-1) if len(cond_emb) > 0 else None
+
+            # cond_emb = torch.cat(cond_emb, dim=-1)
+            if exists(cond_emb):
+                cond_emb = self.mlp(cond_emb)
+                cond_emb = rearrange(cond_emb, 'b c -> b c 1')
+                scale_shift = cond_emb.chunk(2, dim=1)
+            # cond_emb = self.mlp(cond_emb)
+            # cond_emb = rearrange(cond_emb, 'b c -> b c 1')
+            # scale_shift = cond_emb.chunk(2, dim=1)
 
         h = self.block1(x, scale_shift=scale_shift)
         h = self.block2(h)
@@ -260,7 +267,12 @@ class Unet1D(nn.Module):
         x = self.init_conv(x.view(x.size(0), 1, -1))
         r = x.clone()
         t = self.time_mlp(time)
-        c = self.classes_mlp(classes)
+        # Check if classes is provided
+        if exists(classes):
+            c = self.classes_mlp(classes)
+        else:
+            c = None
+        # c = self.classes_mlp(classes)
         h = []
 
         for block1, block2, attn, downsample in self.downs:

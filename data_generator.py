@@ -14,11 +14,12 @@ def set_seed(seed):
 
 class GaussianLatentSampler(object):
     def __init__(self, d_inner, d_outer):
+        # set_seed(seed=42)
         self.d_inner, self.d_outer = d_inner, d_outer
         self.A = ortho_group.rvs(dim=d_outer)[:d_inner, :] # (16,64)
         beta = np.random.randn(d_inner, 1)
-        beta /= np.linalg.norm(beta)  # normalize beta,(16,1)
-        self.theta = self.A.T.dot(beta)
+        self.beta = beta / np.linalg.norm(beta)  # normalize beta,(16,1)
+        self.theta = self.A.T.dot(self.beta)
 
     def generate_data(self, N, theta=None, torch_tensor=False):
         z = np.random.randn(N, self.d_inner)
@@ -26,7 +27,12 @@ class GaussianLatentSampler(object):
         z /= np.linalg.norm(z, axis=-1, keepdims=True)
         
         x = z.dot(self.A)
+        ## label怎么没误差？
         label = x.dot(theta) if theta is not None else x.dot(self.theta)
+        # 添加高斯误差
+        variance = 1e-6  # 你可以根据需要调整方差的大小
+        noise = np.random.randn(*label.shape) * np.sqrt(variance)
+        label=label+noise
         if torch_tensor:
             x, label = torch.from_numpy(x).float(), torch.from_numpy(label).float()
 
@@ -43,12 +49,13 @@ class GaussianLatentSampler(object):
     def evaluate(self, x, penalty=5.0):
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
-        parallel = x.dot(self.A.T).dot(self.A)
-        vertical = x - parallel
-        penalty_term = penalty * np.sum(np.square(vertical), axis=-1).reshape(-1, 1)
+        ## 原来有个pernalty term惩罚不在latent space的x，有点cheating之嫌
+        # parallel = x.dot(self.A.T).dot(self.A)
+        # vertical = x - parallel
+        # penalty_term = penalty * np.sum(np.square(vertical), axis=-1).reshape(-1, 1)
         scores_raw = x.dot(self.theta)
-        scores = scores_raw - penalty_term
-        return torch.from_numpy(scores).float()
+        # scores = scores_raw - penalty_term
+        return torch.from_numpy(scores_raw).float()
 
 
 
@@ -58,8 +65,8 @@ if __name__ == '__main__':
     from unet_1d import Unet1D
     from torch.utils.data import DataLoader
 
-    # random seed
-    set_seed(seed=42)
+    # # random seed
+    # set_seed(seed=42)
 
     # hyperparameters
     N_pred, N_diff, N_eval, N_loss = 8192, 65536, 2048, 8192
